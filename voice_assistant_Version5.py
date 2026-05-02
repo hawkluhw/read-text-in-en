@@ -231,7 +231,7 @@ def _split_text_into_chunks(text: str, max_chars: int = PIPER_MAX_CHARS) -> List
     chunks = []
     # try naive sentence-ish split by punctuation
     import re
-    sentences = re.split(r'(?<=[\.\?\!]\s)', text)
+    sentences = re.split(r'(?<=[\.!?]\s)', text)
     cur = ""
     for s in sentences:
         if len(cur) + len(s) <= max_chars:
@@ -286,7 +286,7 @@ def _tts_worker_for_chunk_text(text: str):
                     with _now_playing_lock:
                         _now_playing = line_text
                     # give the UI a short moment to poll and pick up the change
-                    time.sleep(0.12)
+                    time.sleep(0.35)
                     if line_text:
                         logging.info("Playing chunk %d/%d line %d/%d (%d chars)", i + 1, len(chunks), j + 1, len(lines), len(line_text))
                         _run_piper_to_paplay(line_text)
