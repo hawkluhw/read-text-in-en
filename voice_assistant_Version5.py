@@ -260,6 +260,8 @@ def _tts_worker_for_chunk_text(text: str):
     Background worker: split text into chunks and call piper->paplay per chunk.
     Allows early termination between chunks.
     Updates global _now_playing so the UI can show the currently playing text.
+    This version splits each chunk into individual lines and plays them one-by-one,
+    updating _now_playing per line so the UI can display the current line.
     """
     global _stop_flag, _now_playing
     try:
@@ -268,16 +270,31 @@ def _tts_worker_for_chunk_text(text: str):
             if _stop_flag:
                 logging.info("Stopping before chunk %d", i)
                 break
-            # Update the currently playing string (protected by lock)
-            with _now_playing_lock:
-                # store chunk as the currently playing text; UI can choose how to display
-                _now_playing = chunk
-            logging.info("Playing chunk %d/%d (%d chars)", i + 1, len(chunks), len(chunk))
-            _run_piper_to_paplay(chunk)
-            # small pause to allow responsive stop and avoid immediate re-spawning
-            if _stop_flag:
-                break
-            time.sleep(0.05)
+            # Split chunk into lines and play line-by-line to allow per-line updates
+            lines = chunk.splitlines()
+            if not lines:
+                # Fallback: treat the whole chunk as one piece
+                with _now_playing_lock:
+                    _now_playing = chunk
+                logging.info("Playing chunk %d/%d (%d chars)", i + 1, len(chunks), len(chunk))
+                _run_piper_to_paplay(chunk)
+            else:
+                for j, line in enumerate(lines):
+                    if _stop_flag:
+                        break
+                    line_text = line.strip()
+                    with _now_playing_lock:
+                        _now_playing = line_text
+                    if line_text:
+                        logging.info("Playing chunk %d/%d line %d/%d (%d chars)", i + 1, len(chunks), j + 1, len(lines), len(line_text))
+                        _run_piper_to_paplay(line_text)
+                    else:
+                        # empty line -> small pause
+                        time.sleep(0.05)
+                    if _stop_flag:
+                        break
+                    # small pause between lines to allow responsive stop
+                    time.sleep(0.02)
     except Exception:
         logging.exception("Error in TTS worker")
     finally:
@@ -291,8 +308,8 @@ def read_english_start(file_path, chunk_select, chunk_size) -> Tuple[str, str]:
     """
     Entrypoint called by Gradio when user clicks "Read English".
     This starts a background thread to play audio and immediately returns the chunk's text
-    and an initial "now playing" value (empty, real updates can be fetched via the
-    Refresh Now Playing button).
+    and an initial "now playing" value (empty, real updates are pushed to the UI by
+    the automatic polling mechanism).
     """
     global _stop_flag, _current_thread, _now_playing
     _stop_flag = False
@@ -355,7 +372,8 @@ with gr.Blocks() as app:
     with gr.Row():
         read_button = gr.Button("Read English")
         stop_button = gr.Button("Stop", variant="stop")
-        refresh_now_playing = gr.Button("Refresh Now Playing")
+        # Hidden refresh button: will be clicked periodically via a small client-side JS poll
+        refresh_now_playing_hidden = gr.Button("Refresh Now Playing", visible=False, elem_id="refresh_now_playing_hidden")
 
     # Event handlers
     def on_input_change(file_path, chunk_size):
@@ -371,8 +389,22 @@ with gr.Blocks() as app:
     read_button.click(fn=read_english_start, inputs=[file_input, chunk_select, chunk_size_input], outputs=[text_output, now_playing])
     stop_button.click(fn=stop_tts, inputs=[], outputs=[now_playing])
 
-    # Refresh button to poll the currently playing line from server
-    refresh_now_playing.click(fn=get_now_playing, inputs=[], outputs=[now_playing])
+    # Hidden button hooked to get_now_playing; client-side JS will click it periodically
+    refresh_now_playing_hidden.click(fn=get_now_playing, inputs=[], outputs=[now_playing])
+
+    # Small HTML block to poll the hidden refresh button every 400 ms
+    poll_script = """
+    <script>
+    (function() {
+      function tryClick() {
+        const btn = document.getElementById('refresh_now_playing_hidden');
+        if (btn) { try { btn.click(); } catch (e) { /* ignore */ } }
+      }
+      setInterval(tryClick, 400);
+    })();
+    </script>
+    """
+    gr.HTML(poll_script)
 
     # Use Gradio queue to allow concurrent requests without freezing the server
     app.queue()
