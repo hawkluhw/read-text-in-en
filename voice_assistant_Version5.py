@@ -26,6 +26,10 @@ _current_thread: Optional[threading.Thread] = None
 _current_procs = {"piper": None, "paplay": None}
 _procs_lock = threading.Lock()
 
+# Track currently playing text (for UI)
+_now_playing = ""
+_now_playing_lock = threading.Lock()
+
 
 def _cache_key_for_file(file_obj) -> Optional[Tuple[str, float, int]]:
     if file_obj is None:
@@ -134,6 +138,10 @@ def stop_tts():
     if _current_thread and _current_thread.is_alive():
         _current_thread.join(timeout=1.0)
         _current_thread = None
+    # clear now_playing
+    global _now_playing
+    with _now_playing_lock:
+        _now_playing = ""
 
 
 def _run_piper_to_paplay(text: str, rate: str = '22050'):
@@ -251,6 +259,7 @@ def _tts_worker_for_chunk_text(text: str):
     """
     Background worker: split text into chunks and call piper->paplay per chunk.
     Allows early termination between chunks.
+    Updates global _now_playing so the UI can show the currently playing text.
     """
     global _stop_flag
     try:
@@ -259,6 +268,10 @@ def _tts_worker_for_chunk_text(text: str):
             if _stop_flag:
                 logging.info("Stopping before chunk %d", i)
                 break
+            # Update the currently playing string (protected by lock)
+            with _now_playing_lock:
+                # store chunk as the currently playing text; UI can choose how to display
+                _now_playing = chunk
             logging.info("Playing chunk %d/%d (%d chars)", i + 1, len(chunks), len(chunk))
             _run_piper_to_paplay(chunk)
             # small pause to allow responsive stop and avoid immediate re-spawning
@@ -270,35 +283,43 @@ def _tts_worker_for_chunk_text(text: str):
     finally:
         # ensure we reset the flag and procs on normal completion
         _terminate_processes()
+        with _now_playing_lock:
+            _now_playing = ""
 
 
-def read_english_start(file_path, chunk_select, chunk_size) -> str:
+def read_english_start(file_path, chunk_select, chunk_size) -> Tuple[str, str]:
     """
     Entrypoint called by Gradio when user clicks "Read English".
-    This starts a background thread to play audio and immediately returns the chunk's text.
+    This starts a background thread to play audio and immediately returns the chunk's text
+    and an initial "now playing" value (empty, real updates can be fetched via the
+    Refresh Now Playing button).
     """
-    global _stop_flag, _current_thread
+    global _stop_flag, _current_thread, _now_playing
     _stop_flag = False
 
+    # clear any previous now_playing
+    with _now_playing_lock:
+        _now_playing = ""
+
     if file_path is None or not chunk_select:
-        return ""
+        return "", ""
 
     lines = _get_lines_cached(file_path)
     parts = chunk_select.split(": Line ")
     if len(parts) < 2:
-        return ""
+        return "", ""
 
     try:
         line_range = parts[1].strip()
         start_s, end_s = line_range.split(" to ")
         start, end = int(start_s), int(end_s)
     except Exception:
-        return ""
+        return "", ""
 
     start = max(1, start)
     end = min(len(lines), end)
     if start > end:
-        return ""
+        return "", ""
     current_text = "".join(lines[start - 1:end])
 
     # Start background thread to play the text (non-blocking)
@@ -307,7 +328,16 @@ def read_english_start(file_path, chunk_select, chunk_size) -> str:
     _current_thread = worker
     worker.start()
 
-    return current_text
+    # return both the full chunk text and current now_playing (initially empty)
+    with _now_playing_lock:
+        now = _now_playing
+    return current_text, now
+
+
+def get_now_playing() -> str:
+    """Return the current playing text (empty string if nothing is playing)."""
+    with _now_playing_lock:
+        return _now_playing
 
 
 # Wiring Gradio UI
@@ -321,9 +351,11 @@ with gr.Blocks() as app:
             chunk_select = gr.Radio(label="Select Chunk", choices=[])
         with gr.Column():
             text_output = gr.Textbox(label="File Content", lines=15)
+            now_playing = gr.Textbox(label="Now Playing", lines=3, interactive=False)
     with gr.Row():
         read_button = gr.Button("Read English")
         stop_button = gr.Button("Stop", variant="stop")
+        refresh_now_playing = gr.Button("Refresh Now Playing")
 
     # Event handlers
     def on_input_change(file_path, chunk_size):
@@ -335,8 +367,12 @@ with gr.Blocks() as app:
     chunk_select.change(fn=show_chunk, inputs=[file_input, chunk_select], outputs=text_output)
 
     # read_button starts playback in background and returns the text immediately
-    read_button.click(fn=read_english_start, inputs=[file_input, chunk_select, chunk_size_input], outputs=text_output)
-    stop_button.click(fn=stop_tts, inputs=[], outputs=[])
+    # now also returns current now_playing (initially empty)
+    read_button.click(fn=read_english_start, inputs=[file_input, chunk_select, chunk_size_input], outputs=[text_output, now_playing])
+    stop_button.click(fn=stop_tts, inputs=[], outputs=[now_playing])
+
+    # Refresh button to poll the currently playing line from server
+    refresh_now_playing.click(fn=get_now_playing, inputs=[], outputs=[now_playing])
 
     # Use Gradio queue to allow concurrent requests without freezing the server
     app.queue()
