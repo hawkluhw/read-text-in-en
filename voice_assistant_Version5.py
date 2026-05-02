@@ -29,6 +29,9 @@ _procs_lock = threading.Lock()
 # Track currently playing text (for UI)
 _now_playing = ""
 _now_playing_lock = threading.Lock()
+# nonce to ensure returned string always changes (zero-width chars)
+_now_playing_nonce = '\u200b'
+_now_playing_nonce_lock = threading.Lock()
 
 
 def _cache_key_for_file(file_obj) -> Optional[Tuple[str, float, int]]:
@@ -139,9 +142,12 @@ def stop_tts():
         _current_thread.join(timeout=1.0)
         _current_thread = None
     # clear now_playing
-    global _now_playing
+    global _now_playing, _now_playing_nonce
     with _now_playing_lock:
         _now_playing = ""
+    with _now_playing_nonce_lock:
+        # flip nonce so clients see a change even if text becomes empty
+        _now_playing_nonce = '\u200b' if _now_playing_nonce == '\u200c' else '\u200c'
 
 
 def _run_piper_to_paplay(text: str, rate: str = '22050'):
@@ -231,7 +237,7 @@ def _split_text_into_chunks(text: str, max_chars: int = PIPER_MAX_CHARS) -> List
     chunks = []
     # try naive sentence-ish split by punctuation
     import re
-    sentences = re.split(r'(?<=[\.!?]\s)', text)
+    sentences = re.split(r'(?<=[\.\?\!]\s)', text)
     cur = ""
     for s in sentences:
         if len(cur) + len(s) <= max_chars:
@@ -260,10 +266,9 @@ def _tts_worker_for_chunk_text(text: str):
     Background worker: split text into chunks and call piper->paplay per chunk.
     Allows early termination between chunks.
     Updates global _now_playing so the UI can show the currently playing text.
-    This version splits each chunk into individual lines and plays them one-by-one,
-    updating _now_playing per line so the UI can display the current line.
+    This version updates _now_playing before each chunk and each line when possible.
     """
-    global _stop_flag, _now_playing
+    global _stop_flag, _now_playing, _now_playing_nonce
     try:
         chunks = _split_text_into_chunks(text, PIPER_MAX_CHARS)
         for i, chunk in enumerate(chunks):
@@ -273,10 +278,13 @@ def _tts_worker_for_chunk_text(text: str):
             # Split chunk into lines and play line-by-line to allow per-line updates
             lines = chunk.splitlines()
             if not lines:
-                # Fallback: treat the whole chunk as one piece
                 with _now_playing_lock:
                     _now_playing = chunk
+                with _now_playing_nonce_lock:
+                    _now_playing_nonce = '\u200c' if _now_playing_nonce == '\u200b' else '\u200b'
                 logging.info("Playing chunk %d/%d (%d chars)", i + 1, len(chunks), len(chunk))
+                # give clients a chance to poll
+                time.sleep(0.25)
                 _run_piper_to_paplay(chunk)
             else:
                 for j, line in enumerate(lines):
@@ -285,25 +293,26 @@ def _tts_worker_for_chunk_text(text: str):
                     line_text = line.strip()
                     with _now_playing_lock:
                         _now_playing = line_text
-                    # give the UI a short moment to poll and pick up the change
-                    time.sleep(0.35)
+                    with _now_playing_nonce_lock:
+                        _now_playing_nonce = '\u200c' if _now_playing_nonce == '\u200b' else '\u200b'
+                    # give the client time to poll the new value before blocking on Piper
+                    time.sleep(0.25)
                     if line_text:
                         logging.info("Playing chunk %d/%d line %d/%d (%d chars)", i + 1, len(chunks), j + 1, len(lines), len(line_text))
                         _run_piper_to_paplay(line_text)
                     else:
-                        # empty line -> small pause
                         time.sleep(0.05)
                     if _stop_flag:
                         break
-                    # small pause between lines to allow responsive stop
                     time.sleep(0.02)
     except Exception:
         logging.exception("Error in TTS worker")
     finally:
-        # ensure we reset the flag and procs on normal completion
         _terminate_processes()
         with _now_playing_lock:
             _now_playing = ""
+        with _now_playing_nonce_lock:
+            _now_playing_nonce = '\u200b' if _now_playing_nonce == '\u200c' else '\u200c'
 
 
 def read_english_start(file_path, chunk_select, chunk_size) -> Tuple[str, str]:
@@ -313,12 +322,14 @@ def read_english_start(file_path, chunk_select, chunk_size) -> Tuple[str, str]:
     and an initial "now playing" value (empty, real updates are pushed to the UI by
     the automatic polling mechanism).
     """
-    global _stop_flag, _current_thread, _now_playing
+    global _stop_flag, _current_thread, _now_playing, _now_playing_nonce
     _stop_flag = False
 
     # clear any previous now_playing
     with _now_playing_lock:
         _now_playing = ""
+    with _now_playing_nonce_lock:
+        _now_playing_nonce = '\u200b'
 
     if file_path is None or not chunk_select:
         return "", ""
@@ -350,13 +361,18 @@ def read_english_start(file_path, chunk_select, chunk_size) -> Tuple[str, str]:
     # return both the full chunk text and current now_playing (initially empty)
     with _now_playing_lock:
         now = _now_playing
-    return current_text, now
+    with _now_playing_nonce_lock:
+        nonce = _now_playing_nonce
+    return current_text, now + nonce
 
 
 def get_now_playing() -> str:
     """Return the current playing text (empty string if nothing is playing)."""
     with _now_playing_lock:
-        return _now_playing
+        now = _now_playing
+    with _now_playing_nonce_lock:
+        nonce = _now_playing_nonce
+    return now + nonce
 
 
 # Wiring Gradio UI
@@ -374,8 +390,9 @@ with gr.Blocks() as app:
     with gr.Row():
         read_button = gr.Button("Read English")
         stop_button = gr.Button("Stop", variant="stop")
-        # Hidden refresh button: will be clicked periodically via a small client-side JS poll
-        refresh_now_playing_hidden = gr.Button("Refresh Now Playing", visible=False, elem_id="refresh_now_playing_hidden")
+        # Render the refresh button into the DOM and hide with CSS so polling can find it reliably
+        refresh_now_playing_hidden = gr.Button("Refresh Now Playing", visible=True, elem_id="refresh_now_playing_hidden")
+        gr.HTML('<style>#refresh_now_playing_hidden { display: none !important; }</style>')
 
     # Event handlers
     def on_input_change(file_path, chunk_size):
@@ -387,22 +404,29 @@ with gr.Blocks() as app:
     chunk_select.change(fn=show_chunk, inputs=[file_input, chunk_select], outputs=text_output)
 
     # read_button starts playback in background and returns the text immediately
-    # now also returns current now_playing (initially empty)
     read_button.click(fn=read_english_start, inputs=[file_input, chunk_select, chunk_size_input], outputs=[text_output, now_playing])
     stop_button.click(fn=stop_tts, inputs=[], outputs=[now_playing])
 
     # Hidden button hooked to get_now_playing; client-side JS will click it periodically
     refresh_now_playing_hidden.click(fn=get_now_playing, inputs=[], outputs=[now_playing])
 
-    # Small HTML block to poll the hidden refresh button every 400 ms
+    # Robust polling script: tries multiple selectors and dispatches a real click event every 250 ms
     poll_script = """
     <script>
     (function() {
       function tryClick() {
-        const btn = document.getElementById('refresh_now_playing_hidden');
-        if (btn) { try { btn.click(); } catch (e) { /* ignore */ } }
+        var btn = document.getElementById('refresh_now_playing_hidden') ||
+                  document.querySelector('[id$="refresh_now_playing_hidden"]') ||
+                  document.querySelector('#component-refresh_now_playing_hidden') ||
+                  document.querySelector('button[aria-label="Refresh Now Playing"]');
+        if (btn) {
+          try {
+            var ev = new MouseEvent('click', { view: window, bubbles: true, cancelable: true });
+            btn.dispatchEvent(ev);
+          } catch (e) { /* ignore */ }
+        }
       }
-      setInterval(tryClick, 400);
+      setInterval(tryClick, 250);
     })();
     </script>
     """
