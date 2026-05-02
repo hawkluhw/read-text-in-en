@@ -285,6 +285,8 @@ def _tts_worker_for_chunk_text(text: str):
                     line_text = line.strip()
                     with _now_playing_lock:
                         _now_playing = line_text
+                    # give the UI a short moment to poll and pick up the change
+                    time.sleep(0.12)
                     if line_text:
                         logging.info("Playing chunk %d/%d line %d/%d (%d chars)", i + 1, len(chunks), j + 1, len(lines), len(line_text))
                         _run_piper_to_paplay(line_text)
