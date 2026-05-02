@@ -261,7 +261,7 @@ def _tts_worker_for_chunk_text(text: str):
     Allows early termination between chunks.
     Updates global _now_playing so the UI can show the currently playing text.
     """
-    global _stop_flag
+    global _stop_flag, _now_playing
     try:
         chunks = _split_text_into_chunks(text, PIPER_MAX_CHARS)
         for i, chunk in enumerate(chunks):
